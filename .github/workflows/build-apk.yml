@@ -2,12 +2,18 @@ name: Build APK
 on:
   workflow_dispatch:
   push:
-    paths: ["android-launcher/**"]
+    paths: ["*.zip", ".github/workflows/**"]
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Préparer le projet
+        run: |
+          mkdir work
+          unzip -q appweb.zip -d work
+          unzip -q -o launcher-patch.zip -d work
+          ls work/android-launcher
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -19,8 +25,8 @@ jobs:
         with:
           gradle-version: "8.7"
       - run: gradle assembleDebug --no-daemon
-        working-directory: android-launcher
+        working-directory: work/android-launcher
       - uses: actions/upload-artifact@v4
         with:
           name: launcher-c4-apk
-          path: android-launcher/app/build/outputs/apk/debug/*.apk
+          path: work/android-launcher/app/build/outputs/apk/debug/*.apk
