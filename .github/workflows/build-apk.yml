@@ -1,26 +1,287 @@
 name: Build APK
-
 on:
   workflow_dispatch:
   push:
-    paths: ["launcher-android.zip", ".github/workflows/**"]
-
+    paths: [".github/workflows/**"]
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Préparer le projet
+      - name: Créer le projet Android
         run: |
-          unzip -q launcher-android.zip
-          ls android-launcher android-launcher/app/src/main/res
+          mkdir -p android-launcher/app/src/main/java/fr/c4/launcher android-launcher/app/src/main/assets android-launcher/app/src/main/res/drawable
+          cd android-launcher
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "LauncherC4"
+          include(":app")
+          EOF_FILE
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_FILE
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "fr.c4.launcher"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "fr.c4.launcher"
+                  minSdk = 26
+                  targetSdk = 30 // Android 11 (TS18 head unit)
+                  versionCode = 1
+                  versionName = "1.0"
+                  // Web interface address. Replace with your published URL.
+                  buildConfigField("String", "LAUNCHER_URL", "\"https://roadbeat-stereo-dash.lovable.app/\"")
+              }
+
+              buildFeatures { buildConfig = true }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <!-- Android 11: needed to list and launch every installed app -->
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+              <application
+                  android:label="Launcher C4"
+                  android:icon="@drawable/ic_launcher"
+                  android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen"
+                  android:hardwareAccelerated="true"
+                  android:largeHeap="false">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:screenOrientation="landscape"
+                      android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+                      android:stateNotNeeded="true"
+                      android:clearTaskOnLaunch="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.HOME" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          cat > app/src/main/java/fr/c4/launcher/MainActivity.kt <<'EOF_FILE'
+          package fr.c4.launcher
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.media.AudioManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.util.Base64
+          import android.view.KeyEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.webkit.JavascriptInterface
+          import android.webkit.WebResourceError
+          import android.webkit.WebResourceRequest
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.ByteArrayOutputStream
+
+          class MainActivity : Activity() {
+              private lateinit var web: WebView
+              private var offline = false
+              private val allowedHost: String? by lazy { Uri.parse(BuildConfig.LAUNCHER_URL).host }
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
+                  web = WebView(this).apply {
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = true
+                      settings.mediaPlaybackRequiresUserGesture = false
+                      settings.allowFileAccess = false
+                      overScrollMode = View.OVER_SCROLL_NEVER
+                      setLayerType(View.LAYER_TYPE_HARDWARE, null)
+                      isVerticalScrollBarEnabled = false
+                      webViewClient = object : WebViewClient() {
+                          // The JS bridge can launch apps: keep navigation on our own host only.
+                          override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
+                              if (r.url.host == allowedHost) return false
+                              try {
+                                  startActivity(Intent(Intent.ACTION_VIEW, r.url).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                              } catch (_: Exception) {}
+                              return true
+                          }
+                          override fun onReceivedError(v: WebView, r: WebResourceRequest, e: WebResourceError) {
+                              if (r.isForMainFrame) v.post { showOffline() }
+                          }
+                          override fun onPageFinished(v: WebView, url: String?) {
+                              if (url != null && url.startsWith("http")) offline = false
+                          }
+                      }
+                      addJavascriptInterface(Bridge(this@MainActivity), "AndroidLauncher")
+                      loadUrl(BuildConfig.LAUNCHER_URL)
+                  }
+                  setContentView(web)
+                  hideSystemBars()
+              }
+
+              private fun showOffline() {
+                  offline = true
+                  val html = assets.open("offline.html").bufferedReader().use { it.readText() }
+                      .replace("__URL__", BuildConfig.LAUNCHER_URL)
+                  web.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
+              }
+
+              override fun onResume() { super.onResume(); hideSystemBars() }
+
+              // A launcher must never exit on Back; only navigate inside the web UI.
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() { if (!offline && web.canGoBack()) web.goBack() }
+
+              @Suppress("DEPRECATION")
+              private fun hideSystemBars() {
+                  window.decorView.systemUiVisibility = (View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                      or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_FULLSCREEN
+                      or View.SYSTEM_UI_FLAG_LAYOUT_STABLE)
+              }
+
+              class Bridge(private val ctx: Context) {
+                  private val pm: PackageManager = ctx.packageManager
+
+                  @JavascriptInterface
+                  fun launchPackage(pkg: String): Boolean {
+                      val i = pm.getLaunchIntentForPackage(pkg) ?: return false
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      return try { ctx.startActivity(i); true } catch (e: Exception) { false }
+                  }
+
+                  @JavascriptInterface
+                  fun launchFirst(json: String): Boolean {
+                      val arr = JSONArray(json)
+                      for (k in 0 until arr.length()) if (launchPackage(arr.getString(k))) return true
+                      return false
+                  }
+
+                  @JavascriptInterface
+                  fun launchAction(action: String, data: String): Boolean {
+                      val i = Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      if (data.isNotEmpty()) i.data = Uri.parse(data)
+                      return try { ctx.startActivity(i); true } catch (e: Exception) { false }
+                  }
+
+                  @JavascriptInterface
+                  fun mediaKey(code: Int) {
+                      val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                      am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
+                      am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+                  }
+
+                  @JavascriptInterface
+                  fun listApps(): String {
+                      val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                      val out = JSONArray()
+                      pm.queryIntentActivities(main, 0)
+                          .filter { it.activityInfo.packageName != ctx.packageName }
+                          .sortedBy { it.loadLabel(pm).toString().lowercase() }
+                          .forEach { ri ->
+                              out.put(JSONObject()
+                                  .put("label", ri.loadLabel(pm).toString())
+                                  .put("packageName", ri.activityInfo.packageName)
+                                  .put("icon", iconData(ri.loadIcon(pm))))
+                          }
+                      return out.toString()
+                  }
+
+                  private fun iconData(d: android.graphics.drawable.Drawable): String {
+                      val b = Bitmap.createBitmap(72, 72, Bitmap.Config.ARGB_8888)
+                      val c = Canvas(b); d.setBounds(0, 0, 72, 72); d.draw(c)
+                      val os = ByteArrayOutputStream(); b.compress(Bitmap.CompressFormat.PNG, 90, os); b.recycle()
+                      return "data:image/png;base64," + Base64.encodeToString(os.toByteArray(), Base64.NO_WRAP)
+                  }
+              }
+          }
+          EOF_FILE
+          cat > app/src/main/assets/offline.html <<'EOF_FILE'
+          <!doctype html><html lang="fr"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <style>
+          html,body{margin:0;height:100%;background:#0b1220;color:#e5e7eb;font-family:sans-serif}
+          body{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;text-align:center}
+          h1{font-size:28px;margin:0}p{margin:0;opacity:.7;font-size:18px}
+          button{font-size:20px;padding:14px 28px;border:0;border-radius:14px;background:#3b82f6;color:#fff}
+          </style></head><body>
+          <h1>Connexion indisponible</h1>
+          <p>Nouvelle tentative automatique toutes les 5 secondes…</p>
+          <button onclick="tryNow()">Réessayer</button>
+          <button onclick="AndroidLauncher.launchAction('android.settings.SETTINGS','')">Réglages</button>
+          <script>
+          var URL_="__URL__";
+          function tryNow(){fetch(URL_,{mode:"no-cors",cache:"no-store"}).then(function(){location.replace(URL_)}).catch(function(){})}
+          setInterval(tryNow,5000);
+          </script></body></html>
+          EOF_FILE
+          cat > app/src/main/res/drawable/ic_launcher.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="96dp" android:height="96dp"
+              android:viewportWidth="96" android:viewportHeight="96">
+              <path android:fillColor="#0B1220" android:pathData="M0,0h96v96h-96z"/>
+              <path android:strokeColor="#3B82F6" android:strokeWidth="9" android:fillColor="#00000000"
+                  android:pathData="M48,48m-28,0a28,28 0,1 1,56 0a28,28 0,1 1,-56 0"/>
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M48,48m-8,0a8,8 0,1 1,16 0a8,8 0,1 1,-16 0"/>
+          </vector>
+          EOF_FILE
+          ls -R . | head -40
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
       - uses: android-actions/setup-android@v3
         with:
-          accept-android-sdk-licenses: true
           packages: "platform-tools platforms;android-34 build-tools;34.0.0"
       - uses: gradle/actions/setup-gradle@v4
         with:
